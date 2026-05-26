@@ -1,0 +1,520 @@
+.include "m2560def.inc"
+
+; =====================================================
+; 3-METER PARKING GATE SYSTEM — ATmega2560
+; =====================================================
+; PORTB (OUTPUT) — LEDs
+;   PB0 = Meter 1 RED
+;   PB1 = Meter 1 GREEN
+;   PB2 = Meter 2 RED
+;   PB3 = Meter 2 GREEN
+;   PB4 = Meter 3 RED
+;   PB5 = Meter 3 GREEN
+;
+; PORTA (OUTPUT) — Motors/Servos
+;   PA0 = Motor 1 PWM
+;   PA1 = Motor 2 PWM
+;   PA2 = Motor 3 PWM
+;
+; PORTD (INPUT + PULL-UP) — Buttons (Interrupts)
+;   PD0 = Button 1 ? INT0 (falling edge)
+;   PD1 = Button 2 ? INT1 (falling edge)
+;   PD2 = Button 3 ? INT2 (falling edge)
+;
+; PORTC (INPUT + PULL-UP) — Sensors (Polled)
+;   PC0 = Sensor 1 (LOW = car present)
+;   PC1 = Sensor 2 (LOW = car present)
+;   PC2 = Sensor 3 (LOW = car present)
+; =====================================================
+
+; ---------------------------------------------
+; CONSTANTS
+; ---------------------------------------------
+.equ NN         = 18            ; Delay4us tuning constant
+
+; LED bitmasks on PORTB
+.equ M1_RED     = 0b00000001    ; PB0
+.equ M1_GREEN   = 0b00000010    ; PB1
+.equ M2_RED     = 0b00000100    ; PB2
+.equ M2_GREEN   = 0b00001000    ; PB3
+.equ M3_RED     = 0b00010000    ; PB4
+.equ M3_GREEN   = 0b00100000    ; PB5
+
+; Motor bitmasks on PORTA
+.equ M1_MOTOR   = 0b00000001    ; PA0
+.equ M2_MOTOR   = 0b00000010    ; PA1
+.equ M3_MOTOR   = 0b00000100    ; PA2
+
+; Sensor bit positions on PORTC (polled)
+.equ S1_BIT     = 0             ; PC0
+.equ S2_BIT     = 1             ; PC1
+.equ S3_BIT     = 2             ; PC2
+
+; ---------------------------------------------
+; SRAM FLAGS — set by ISR, cleared by main loop
+; ---------------------------------------------
+.dseg
+.org 0x0200
+flag_m1: .byte 1                ; 0x01 = button pressed for meter 1
+flag_m2: .byte 1                ; 0x01 = button pressed for meter 2
+flag_m3: .byte 1                ; 0x01 = button pressed for meter 3
+
+; ---------------------------------------------
+; VECTOR TABLE
+; ---------------------------------------------
+.cseg
+.org 0x0000
+    jmp START
+.org 0x0002
+    jmp ISR_BTN1                ; INT0 — Button 1
+.org 0x0004
+    jmp ISR_BTN2                ; INT1 — Button 2
+.org 0x0006
+    jmp ISR_BTN3                ; INT2 — Button 3
+
+; ---------------------------------------------
+; START — Initialisation
+; ---------------------------------------------
+START:
+    ; Stack pointer
+    ldi r16, low(RAMEND)
+    out SPL, r16
+    ldi r16, high(RAMEND)
+    out SPH, r16
+
+    ; PORTB = all outputs (LEDs)
+    ldi r16, 0xFF
+    out DDRB, r16
+
+    ; PORTA lower 3 bits = outputs (motors)
+    ldi r16, 0x07
+    out DDRA, r16
+
+    ; PORTC = all inputs (sensors)
+    ldi r16, 0x00
+    out DDRC, r16
+    ldi r16, 0xFF
+    out PORTC, r16              ; Enable internal pull-ups on all PC pins
+
+    ; PORTD = all inputs (buttons)
+    ldi r16, 0x00
+    out DDRD, r16
+    ldi r16, 0xFF
+    out PORTD, r16              ; Enable internal pull-ups on all PD pins
+
+    ; INT0, INT1, INT2 — falling edge triggered
+    ; ISCx1:ISCx0 = 10 ? falling edge
+    ; EICRA bits: [ISC31|ISC30|ISC21|ISC20|ISC11|ISC10|ISC01|ISC00]
+    ;              0      0     1     0     1     0     1     0    = 0x2A
+    ldi r16, 0b00101010
+    sts EICRA, r16
+
+    ; Enable INT0, INT1, INT2
+    ldi r16, (1<<INT0)|(1<<INT1)|(1<<INT2)
+    out EIMSK, r16
+
+    ; Clear all SRAM flags
+    ldi r16, 0x00
+    sts flag_m1, r16
+    sts flag_m2, r16
+    sts flag_m3, r16
+
+    ; All RED lights ON at startup (gates closed)
+    ldi r16, M1_RED | M2_RED | M3_RED
+    out PORTB, r16
+
+    ; All motors OFF
+    ldi r16, 0x00
+    out PORTA, r16
+
+    sei                         ; Enable global interrupts
+
+; ---------------------------------------------
+; MAIN LOOP — checks flags and polls sensors
+; ---------------------------------------------
+MAIN_LOOP:
+
+    ; -- METER 1 ------------------------------
+    lds r20, flag_m1
+    cpi r20, 0x01
+    brne CHECK_SENSOR1          ; No flag ? poll sensor
+
+    rcall CYCLE_M1              ; Flag set ? full gate cycle
+    ldi r20, 0x00
+    sts flag_m1, r20            ; Clear flag after cycle
+
+CHECK_SENSOR1:
+    in r16, PINC
+    sbrs r16, S1_BIT            ; Skip if HIGH (no car)
+    rcall CAR_DETECTED_M1       ; LOW = car present
+
+    ; -- METER 2 ------------------------------
+    lds r20, flag_m2
+    cpi r20, 0x01
+    brne CHECK_SENSOR2
+
+    rcall CYCLE_M2
+    ldi r20, 0x00
+    sts flag_m2, r20
+
+CHECK_SENSOR2:
+    in r16, PINC
+    sbrs r16, S2_BIT
+    rcall CAR_DETECTED_M2
+
+    ; -- METER 3 ------------------------------
+    lds r20, flag_m3
+    cpi r20, 0x01
+    brne CHECK_SENSOR3          ; ? FIXED: was brne LOOP_END
+
+    rcall CYCLE_M3
+    ldi r20, 0x00
+    sts flag_m3, r20
+
+CHECK_SENSOR3:                  ; ? FIXED: now reachable
+    in r16, PINC
+    sbrs r16, S3_BIT
+    rcall CAR_DETECTED_M3
+
+LOOP_END:
+    rcall Delay1ms              ; Small poll debounce delay
+    rjmp MAIN_LOOP
+
+; ---------------------------------------------
+; GATE CYCLE ROUTINES
+; Button pressed ? open gate ? green 10s ? red 2s ? close gate
+; ---------------------------------------------
+CYCLE_M1:
+    push r16
+    rcall OPEN_M1               ; Open the gate (servo PWM)
+    ; Green ON, Red OFF
+    in r16, PORTB
+    ori r16, M1_GREEN
+    andi r16, ~M1_RED
+    out PORTB, r16
+    rcall Delays10S             ; Green for 10 seconds
+    ; Red ON, Green OFF
+    in r16, PORTB
+    ori r16, M1_RED
+    andi r16, ~M1_GREEN
+    out PORTB, r16
+    rcall Delays2S              ; Red warning for 2 seconds
+    rcall CLOSE_M1              ; Close the gate (servo PWM)
+    pop r16
+    ret
+
+CYCLE_M2:
+    push r16
+    rcall OPEN_M2
+    in r16, PORTB
+    ori r16, M2_GREEN
+    andi r16, ~M2_RED
+    out PORTB, r16
+    rcall Delays10S
+    in r16, PORTB
+    ori r16, M2_RED
+    andi r16, ~M2_GREEN
+    out PORTB, r16
+    rcall Delays2S
+    rcall CLOSE_M2
+    pop r16
+    ret
+
+CYCLE_M3:
+    push r16
+    rcall OPEN_M3
+    in r16, PORTB
+    ori r16, M3_GREEN
+    andi r16, ~M3_RED
+    out PORTB, r16
+    rcall Delays10S
+    in r16, PORTB
+    ori r16, M3_RED
+    andi r16, ~M3_GREEN
+    out PORTB, r16
+    rcall Delays2S
+    rcall CLOSE_M3
+    pop r16
+    ret
+
+; ---------------------------------------------
+; CAR DETECTED ROUTINES
+; Sensor LOW ? green ON ? wait car to pass ? close gate ? red ON
+; ---------------------------------------------
+CAR_DETECTED_M1:
+    push r16
+    ; Green ON, Red OFF
+    in r16, PORTB
+    ori r16, M1_GREEN
+    andi r16, ~M1_RED
+    out PORTB, r16
+    ; Wait until car has fully passed (sensor goes HIGH)
+WAIT_CLEAR_M1:
+    in r16, PINC
+    sbrs r16, S1_BIT            ; Skip if HIGH (car gone)
+    rjmp WAIT_CLEAR_M1          ; Still LOW ? still there
+    ; Small debounce after car leaves
+    rcall Delays2S
+    ; Red ON, Green OFF
+    in r16, PORTB
+    ori r16, M1_RED
+    andi r16, ~M1_GREEN
+    out PORTB, r16
+    ; Close the gate after car passes ? FIXED
+    rcall CLOSE_M1
+    pop r16
+    ret
+
+CAR_DETECTED_M2:
+    push r16
+    in r16, PORTB
+    ori r16, M2_GREEN
+    andi r16, ~M2_RED
+    out PORTB, r16
+WAIT_CLEAR_M2:
+    in r16, PINC
+    sbrs r16, S2_BIT
+    rjmp WAIT_CLEAR_M2
+    rcall Delays2S
+    in r16, PORTB
+    ori r16, M2_RED
+    andi r16, ~M2_GREEN
+    out PORTB, r16
+    rcall CLOSE_M2              ; ? FIXED
+    pop r16
+    ret
+
+CAR_DETECTED_M3:
+    push r16
+    in r16, PORTB
+    ori r16, M3_GREEN
+    andi r16, ~M3_RED
+    out PORTB, r16
+WAIT_CLEAR_M3:
+    in r16, PINC
+    sbrs r16, S3_BIT
+    rjmp WAIT_CLEAR_M3
+    rcall Delays2S
+    in r16, PORTB
+    ori r16, M3_RED
+    andi r16, ~M3_GREEN
+    out PORTB, r16
+    rcall CLOSE_M3              ; ? FIXED
+    pop r16
+    ret
+
+; ---------------------------------------------
+; MOTOR OPEN — 1ms pulse / 20ms period × 200 = ~4s
+; Each motor uses its own bit on PORTA
+; ---------------------------------------------
+OPEN_M1:
+    push r20
+    ldi r20, 200
+open_m1_lp:
+    in r16, PORTA
+    ori r16, M1_MOTOR
+    out PORTA, r16              ; Motor pin HIGH
+    rcall Delay1ms              ; 1ms pulse (open position)
+    in r16, PORTA
+    andi r16, ~M1_MOTOR
+    out PORTA, r16              ; Motor pin LOW
+    rcall Delay18ms
+    rcall Delay1ms              ; 19ms low ? 20ms period
+    dec r20
+    brne open_m1_lp
+    pop r20
+    ret
+
+OPEN_M2:
+    push r20
+    ldi r20, 200
+open_m2_lp:
+    in r16, PORTA
+    ori r16, M2_MOTOR
+    out PORTA, r16
+    rcall Delay1ms
+    in r16, PORTA
+    andi r16, ~M2_MOTOR
+    out PORTA, r16
+    rcall Delay18ms
+    rcall Delay1ms
+    dec r20
+    brne open_m2_lp
+    pop r20
+    ret
+
+OPEN_M3:
+    push r20
+    ldi r20, 200
+open_m3_lp:
+    in r16, PORTA
+    ori r16, M3_MOTOR
+    out PORTA, r16
+    rcall Delay1ms
+    in r16, PORTA
+    andi r16, ~M3_MOTOR
+    out PORTA, r16
+    rcall Delay18ms
+    rcall Delay1ms
+    dec r20
+    brne open_m3_lp
+    pop r20
+    ret
+
+; ---------------------------------------------
+; MOTOR CLOSE — 2ms pulse / 20ms period × 200 = ~4s
+; ---------------------------------------------
+CLOSE_M1:
+    push r20
+    ldi r20, 200
+close_m1_lp:
+    in r16, PORTA
+    ori r16, M1_MOTOR
+    out PORTA, r16              ; Motor pin HIGH
+    rcall Delay1ms
+    rcall Delay1ms              ; 2ms pulse (close position)
+    in r16, PORTA
+    andi r16, ~M1_MOTOR
+    out PORTA, r16              ; Motor pin LOW
+    rcall Delay18ms             ; 18ms low ? 20ms period
+    dec r20
+    brne close_m1_lp
+    pop r20
+    ret
+
+CLOSE_M2:
+    push r20
+    ldi r20, 200
+close_m2_lp:
+    in r16, PORTA
+    ori r16, M2_MOTOR
+    out PORTA, r16
+    rcall Delay1ms
+    rcall Delay1ms
+    in r16, PORTA
+    andi r16, ~M2_MOTOR
+    out PORTA, r16
+    rcall Delay18ms
+    dec r20
+    brne close_m2_lp
+    pop r20
+    ret
+
+CLOSE_M3:
+    push r20
+    ldi r20, 200
+close_m3_lp:
+    in r16, PORTA
+    ori r16, M3_MOTOR
+    out PORTA, r16
+    rcall Delay1ms
+    rcall Delay1ms
+    in r16, PORTA
+    andi r16, ~M3_MOTOR
+    out PORTA, r16
+    rcall Delay18ms
+    dec r20
+    brne close_m3_lp
+    pop r20
+    ret
+
+; ---------------------------------------------
+; ISRs — Buttons ONLY set SRAM flags (fast exit)
+; All heavy work is done in the main loop
+; ---------------------------------------------
+ISR_BTN1:
+    push r16
+    in r16, SREG
+    push r16
+    ldi r16, 0x01
+    sts flag_m1, r16            ; Set flag for meter 1
+    pop r16
+    out SREG, r16
+    pop r16
+    reti
+
+ISR_BTN2:
+    push r16
+    in r16, SREG
+    push r16
+    ldi r16, 0x01
+    sts flag_m2, r16            ; Set flag for meter 2
+    pop r16
+    out SREG, r16
+    pop r16
+    reti
+
+ISR_BTN3:
+    push r16
+    in r16, SREG
+    push r16
+    ldi r16, 0x01
+    sts flag_m3, r16            ; Set flag for meter 3
+    pop r16
+    out SREG, r16
+    pop r16
+    reti
+
+; ---------------------------------------------
+; DELAY LIBRARY
+; ---------------------------------------------
+
+; ~4us at 16MHz
+Delay4us:
+    push r16
+    ldi r16, NN
+d4_loop:
+    dec r16
+    brne d4_loop
+    pop r16
+    ret
+
+; ~1ms = 250 × 4us
+Delay1ms:
+    push r17
+    ldi r17, 250
+d1_lp:
+    rcall Delay4us
+    dec r17
+    brne d1_lp
+    pop r17
+    ret
+
+; ~18ms = 18 × 1ms
+Delay18ms:
+    push r18
+    ldi r18, 18
+d18_lp:
+    rcall Delay1ms
+    dec r18
+    brne d18_lp
+    pop r18
+    ret
+
+; ~2 seconds = 8 × 250 × 1ms
+Delays2S:
+    push r19
+    push r20
+    ldi r20, 8                  ; outer loop
+d2S_outer:
+    ldi r19, 250                ; inner loop
+d2S_inner:
+    rcall Delay1ms
+    dec r19
+    brne d2S_inner
+    dec r20
+    brne d2S_outer
+    pop r20                     ; LIFO: pop r20 first
+    pop r19
+    ret
+
+; ~10 seconds = 5 × 2s
+Delays10S:
+    push r21
+    ldi r21, 5
+d10S_lp:
+    rcall Delays2S
+    dec r21
+    brne d10S_lp
+    pop r21
+    ret
